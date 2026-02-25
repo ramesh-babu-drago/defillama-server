@@ -2,26 +2,23 @@ import * as HyperExpress from "hyper-express";
 import * as path from "path";
 import { getCategoryChartByChainData, getTagChartByChainData } from "../../getCategoryChartByChainData";
 import { chainAssetHistoricalFlows, chainAssetFlows, chainAssetChart } from "../../api2ChainAssets";
-import { getChainChartData } from "../../getChart";
-import { getChainDefaultChartData } from "../../getDefaultChart";
-import { getFormattedChains } from "../../getFormattedChains";
 import { pgGetInflows } from "../db/inflows";
-import { getSimpleChainDatasetInternal } from "../../getSimpleChainDataset";
+import { getSimpleChainDatasetInternal } from "./getSimpleChainDataset";
 import { getTokensInProtocolsInternal } from "../../getTokenInProtocols";
 import craftCsvDataset from "../../storeTvlUtils/craftCsvDataset";
 import { getTweetStats } from "../../twitter/db";
 import { getCurrentUnixTimestamp } from "../../utils/date";
-import { chainNameToIdMap } from "../../utils/normalizeChain";
+import { chainNameToIdMap, chainKeyToChainLabelMap, chainLabelsToKeyMap, getChainLabelFromKey } from "../../utils/normalizeChain";
 import { getR2 } from "../../utils/r2";
 import { get20MinDate } from "../../utils/shared";
 import sluggify from "../../utils/sluggify";
 import { cache, getLastHourlyRecord, getLastHourlyTokensUsd, protocolHasMisrepresentedTokens, } from "../cache";
-import { readRouteData, } from "../cache/file-cache";
-import { cachedCraftParentProtocolV2 } from "../utils/craftParentProtocolV2";
-import { cachedCraftProtocolV2 } from "../utils/craftProtocolV2";
+import { cachedCraftParentProtocolV2, craftParentProtocolV2 } from "../utils/craftParentProtocolV2";
+import { craftProtocolV2 } from "../utils/craftProtocolV2";
 import { getDimensionsMetadata } from "../utils/dimensionsUtils";
-import { getDimensionProtocolFileRoute, getOverviewFileRoute, } from "./dimensions";
+import { getDimensionChainRoutes, getDimensionOverviewRoutes, getDimensionProtocolFileRoute, getDimensionProtocolRoutes, getOverviewFileRoute, } from "./dimensions";
 import { errorResponse, errorWrapper as ew, fileResponse, successResponse } from "./utils";
+import { readRouteData } from "../cache/file-cache";
 
 /* import { getProtocolUsersHandler } from "../../getProtocolUsers";
 import { getSwapDailyVolume } from "../../dexAggregators/db/getSwapDailyVolume";
@@ -36,7 +33,6 @@ import { saveBlacklistPemrit } from "../../dexAggregators/db/saveBlacklistPemrit
 
 export default function setRoutes(router: HyperExpress.Router, routerBasePath: string) {
   // todo add logging middleware to all routes
-  // router.get("/hourly/:name", (async (req, res) => getProtocolishData(req, res, { dataType: 'protocol', useHourlyData: true, skipAggregatedTvl: false })));  // too expensive to handle here
   // router.get("/config/:chain/:contract", ew(getContractName));  // too many requests to handle here
   // add secret route to delete from PG cache
 
@@ -46,7 +42,7 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
   router.get("/treasury/:name", ew(async (req: any, res: any) => getProtocolishData(req, res, { dataType: 'treasury' })));
   router.get("/entity/:name", ew(async (req: any, res: any) => getProtocolishData(req, res, { dataType: 'entities' })));
   router.get("/updatedProtocol/:name", (async (req, res) => getProtocolishData(req, res, {
-    dataType: 'protocol', useHourlyData: false, skipAggregatedTvl: req.query_parameters.includeAggregatedTvl !== 'true',
+    dataType: 'protocol', skipAggregatedTvl: req.query_parameters.includeAggregatedTvl !== 'true',
     restrictResponseSize: req.query_parameters.restrictResponseSize !== 'false',
   })));
 
@@ -63,9 +59,12 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
   router.get("/config/smol/:name", ew(smolConfigHandler));
   router.get("/raises", defaultFileHandler);
   router.get("/hacks", defaultFileHandler);
+  router.get("/token-rights", defaultFileHandler);
   router.get("/oracles", defaultFileHandler);
   router.get("/forks", defaultFileHandler);
   router.get("/rwa/stats", defaultFileHandler);
+  //  router.get("/rwa/active-tvls", ew(async (req: any, res: any) => rwaCurrentHandler(req, res)));
+  // router.get("/rwa/historical/:name", ew(async (req: any, res: any) => rwaChartHandler(req, res)));
   router.get("/categories", defaultFileHandler);
   router.get("/langs", defaultFileHandler);
   router.get("/lite/charts/:chain", defaultFileHandler);
@@ -108,16 +107,17 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
   router.get("/twitter/overview", ew(getTwitterOverview))
   router.get("/twitter/user/:handle", ew(getTwitterData))
 
-  router.get("/charts", ew(getChartsData))
-  router.get("/charts/:name", ew(getChartsData))
-  router.get("/v2/historicalChainTvl", ew(getHistoricalChainTvlData))
-  router.get("/v2/historicalChainTvl/:name", ew(getHistoricalChainTvlData))
+  router.get("/charts", v1ChartsGlobalResponse)
+  router.get("/charts/:name", defaultFileHandler)
+  router.get("/v2/historicalChainTvl", historicalChainTvlGlobalResponse)
+  router.get("/v2/historicalChainTvl/:name", defaultFileHandler)
 
   router.get("/overview/:type", ew(getOverviewFileRoute))
   router.get("/overview/:type/:chain", ew(getOverviewFileRoute))
   router.get("/summary/:type/:name", ew(getDimensionProtocolFileRoute))
   router.get("/overview/_internal/dimensions-metadata", ew(getDimensionsMetadataRoute))
   router.get("/overview/_internal/chain-name-id-map", async (_req: HyperExpress.Request, res: HyperExpress.Response) => successResponse(res, chainNameToIdMap, 60))
+  router.get("/overview/_internal/chain-name-id-map-v2", async (_req: HyperExpress.Request, res: HyperExpress.Response) => successResponse(res, { chainKeyToChainLabelMap, chainLabelsToKeyMap }, 60))
 
 
   router.get("/_fe/static/*", defaultFileHandler)
@@ -128,12 +128,64 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
   router.get("/_fe/treasury-mini/:name", ew(async (req: any, res: any) => getProtocolishData(req, res, { dataType: 'treasury', feMini: true, })));
   router.get("/_fe/entity-mini/:name", ew(async (req: any, res: any) => getProtocolishData(req, res, { dataType: 'entities', feMini: true, })));
   router.get("/_fe/updatedProtocol-mini/:name", (async (req, res) => getProtocolishData(req, res, {
-    dataType: 'protocol', useHourlyData: false, skipAggregatedTvl: req.query_parameters.includeAggregatedTvl !== 'true',
+    dataType: 'protocol', skipAggregatedTvl: req.query_parameters.includeAggregatedTvl !== 'true',
     restrictResponseSize: false, feMini: true,
   })));
 
 
   router.get("/activeUsers", defaultFileHandler)
+
+
+
+  // v2
+
+  // v2 - tvl
+  
+  router.get("/v2/metrics/tvl/protocol/:name", ew(getTvlProtocolRoutes('protocol', 'overview')))
+  router.get("/v2/chart/tvl/protocol/:name", ew(getTvlProtocolRoutes('protocol', 'chart-total')))
+  router.get("/v2/chart/tvl/protocol/:name/chain-breakdown", ew(getTvlProtocolRoutes('protocol', 'chart-chain-breakdown')))
+  router.get("/v2/chart/tvl/protocol/:name/token-breakdown", ew(getTvlProtocolRoutes('protocol', 'chart-token-breakdown')))
+  
+  // v2 - treasury
+  
+  router.get("/v2/metrics/treasury/protocol/:name", ew(getTvlProtocolRoutes('treasury', 'overview')))
+  router.get("/v2/chart/treasury/protocol/:name", ew(getTvlProtocolRoutes('treasury', 'chart-total')))
+  router.get("/v2/chart/treasury/protocol/:name/chain-breakdown", ew(getTvlProtocolRoutes('treasury', 'chart-chain-breakdown')))
+  router.get("/v2/chart/treasury/protocol/:name/token-breakdown", ew(getTvlProtocolRoutes('treasury', 'chart-token-breakdown')))
+  
+  // v2 - oracle
+  
+  router.get("/v2/metrics/oracle", ew(getOraclesRoutes('overview')))
+  router.get("/v2/chart/oracle", ew(getOraclesRoutes('chart-total')))
+  router.get("/v2/chart/oracle/protocol-breakdown", ew(getOraclesRoutes('chart-protocol-breakdown')))
+  router.get("/v2/chart/oracle/chain-breakdown", ew(getOraclesRoutes('chart-chain-breakdown')))
+  router.get("/v2/chart/oracle/protocol/:protocol", ew(getOraclesRoutes('chart-total')))
+  router.get("/v2/chart/oracle/protocol/:protocol/chain-breakdown", ew(getOraclesRoutes('chart-chain-breakdown')))
+  router.get("/v2/chart/oracle/chain/:chain", ew(getOraclesRoutes('chart-total')))
+  router.get("/v2/chart/oracle/chain/:chain/protocol-breakdown", ew(getOraclesRoutes('chart-protocol-breakdown')))
+  
+  // v2 - fork
+  router.get("/v2/metrics/fork", ew(getForksRoutes('overview')))
+  router.get("/v2/chart/fork/protocol-breakdown", ew(getForksRoutes('chart-total')))
+  router.get("/v2/chart/fork/protocol/:protocol", ew(getForksRoutes('chart-total')))
+
+  // v2 - dimensions
+
+  router.get("/v2/metrics/:type", ew(getDimensionOverviewRoutes('overview')))
+  router.get("/v2/chart/:type", ew(getDimensionOverviewRoutes('chart')))
+  router.get("/v2/chart/:type/chain-breakdown", ew(getDimensionOverviewRoutes('chart-chain-breakdown')))
+  router.get("/v2/chart/:type/protocol-breakdown", ew(getDimensionOverviewRoutes('chart-protocol-breakdown')))
+
+  router.get("/v2/metrics/:type/chain/:chain", ew(getDimensionChainRoutes('overview')))
+  router.get("/v2/chart/:type/chain/:chain", ew(getDimensionChainRoutes('chart')))
+  router.get("/v2/chart/:type/chain/:chain/protocol-breakdown", ew(getDimensionChainRoutes('chart-protocol-breakdown')))
+
+  // this includes special route financial statement
+  router.get("/v2/metrics/:type/protocol/:name", ew(getDimensionProtocolRoutes('overview')))
+  router.get("/v2/chart/:type/protocol/:name", ew(getDimensionProtocolRoutes('chart')))
+  router.get("/v2/chart/:type/protocol/:name/chain-breakdown", ew(getDimensionProtocolRoutes('chart-chain-breakdown')))
+  router.get("/v2/chart/:type/protocol/:name/version-breakdown", ew(getDimensionProtocolRoutes('chart-version-breakdown')))
+  router.get("/v2/chart/:type/protocol/:name/label-breakdown", ew(getDimensionProtocolRoutes('chart-label-breakdown')))
 
 
   /* 
@@ -183,17 +235,38 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
     return fileResponse('lite/charts-total', res);
   }
 
+  function v1ChartsGlobalResponse(_req: HyperExpress.Request, res: HyperExpress.Response) {
+    return fileResponse('charts-total', res);
+  }
+
+  function historicalChainTvlGlobalResponse(_req: HyperExpress.Request, res: HyperExpress.Response) {
+    return fileResponse('v2/historicalChainTvl-total', res);
+  }
+
   function protocolsRouteResponse(req: HyperExpress.Request, res: HyperExpress.Response) {
     if (req.query_parameters.includeChains === 'true')
       return fileResponse('protocols-with-chains', res);
+    if (req.query_parameters.liteV1 === 'true')
+      return fileResponse('protocols-lite-v1', res);
     return fileResponse('protocols', res);
   }
 
-  function tvlHandler(req: HyperExpress.Request, res: HyperExpress.Response) {
+  async function tvlHandler(req: HyperExpress.Request, res: HyperExpress.Response) {
     let name = sluggify({ name: req.path_parameters.name } as any)
 
-    let protocolData = cache.protocolSlugMap[name]
-    if (protocolData) return successResponse(res, getLastHourlyRecord(protocolData)?.tvl, 60);
+    const protocolData = cache.protocolSlugMap[name]
+    // a shortcut to just get tvl number, can uncomment the code below to get the correct number
+    if (protocolData) return successResponse(res, getLastHourlyRecord(protocolData)?.tvl, 60)
+/*     if (protocolData) {
+      const response = await cachedCraftProtocolV2({
+        protocolData,
+        useNewChainNames: true,
+        skipAggregatedTvl: false,
+      })
+      const tvlArray = response.tvl as any[]
+      const tvl = tvlArray?.[tvlArray.length - 1]?.totalLiquidityUSD
+      return successResponse(res, tvl, 60);
+    } */
 
     const parentData = cache.parentProtocolSlugMap[name]
     if (parentData) {
@@ -201,8 +274,13 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
       if (childProtocols.length < 1 || childProtocols.map((p: any) => p.name).includes(parentData.name))
         return errorResponse(res, 'bad parent protocol')
 
-      const tvl = childProtocols.map(getLastHourlyRecord).reduce((acc: number, cur: any) => acc + cur?.tvl, 0);
-      if (isNaN(tvl)) return errorResponse(res, 'Error fetching tvl')
+      const response: any = await cachedCraftParentProtocolV2({
+        parentProtocol: parentData,
+        skipAggregatedTvl: false,
+      })
+      if (response.message) return errorResponse(res, response.message)
+      const tvlArray = response.tvl as any[]
+      const tvl = tvlArray?.[tvlArray.length - 1]?.totalLiquidityUSD
       return successResponse(res, tvl, 60);
     }
 
@@ -234,7 +312,7 @@ export default function setRoutes(router: HyperExpress.Router, routerBasePath: s
 
 }
 
-async function getProtocolishData(req: HyperExpress.Request, res: HyperExpress.Response, { dataType, useHourlyData = false, skipAggregatedTvl = true, useNewChainNames = true, restrictResponseSize = true, feMini = false }: GetProtocolishOptions) {
+async function getProtocolishData(req: HyperExpress.Request, res: HyperExpress.Response, { dataType, skipAggregatedTvl = true, useNewChainNames = true, restrictResponseSize = true, feMini = false }: GetProtocolishOptions) {
   let name = decodeURIComponent(req.path_parameters.name);
   name = sluggify({ name } as any);
   const protocolData = (cache as any)[dataType + 'SlugMap'][name];
@@ -246,9 +324,8 @@ async function getProtocolishData(req: HyperExpress.Request, res: HyperExpress.R
   if (!protocolData && dataType === 'protocol') {
     const parentProtocol = (cache as any)['parentProtocolSlugMap'][name];
     if (parentProtocol) {
-      const responseData = await cachedCraftParentProtocolV2({
+      const responseData = await craftParentProtocolV2({
         parentProtocol: parentProtocol,
-        useHourlyData,
         skipAggregatedTvl,
         feMini,
       });
@@ -264,10 +341,9 @@ async function getProtocolishData(req: HyperExpress.Request, res: HyperExpress.R
 
   restrictResponseSize = false // hack to revert to old behavior
 
-  const responseData = await cachedCraftProtocolV2({
+  const responseData = await craftProtocolV2({
     protocolData,
     useNewChainNames,
-    useHourlyData,
     skipAggregatedTvl,
     restrictResponseSize,
     feMini,
@@ -337,7 +413,6 @@ async function getDataset(req: HyperExpress.Request, res: HyperExpress.Response)
 
 type GetProtocolishOptions = {
   dataType: string,
-  useHourlyData?: boolean,
   skipAggregatedTvl?: boolean,
   useNewChainNames?: boolean,
   restrictResponseSize?: boolean,
@@ -378,11 +453,6 @@ async function getInflows(req: HyperExpress.Request, res: HyperExpress.Response)
       protocolData, tokensToExclude,
       skipTokenLogs: true, timestamp, endTimestamp,
     }) */
-}
-
-async function getFormattedChainsData(req: HyperExpress.Request, res: HyperExpress.Response) {
-  let category = req.path_parameters.category ?? ''
-  return successResponse(res, await getFormattedChains(category), 30);
 }
 
 type R2DataOptions = {
@@ -433,52 +503,231 @@ async function chainAssetsHandler(req: HyperExpress.Request, res: HyperExpress.R
   return successResponse(res, data, 60);
 }
 
-
-async function getChartsData(req: HyperExpress.Request, res: HyperExpress.Response) {
-  const name = decodeURIComponent(req.path_parameters?.name ?? '')
-  try {
-    const data = await getChainChartData(name.toLowerCase(), await _getChainChartData(name))
-    return successResponse(res, data, 60);
-  } catch (e) {
-    return errorResponse(res, 'There is no chain with that name: ' + name)
-  }
-}
-
-async function getHistoricalChainTvlData(req: HyperExpress.Request, res: HyperExpress.Response) {
-  const name = decodeURIComponent(req.path_parameters?.name ?? '')
-  try {
-    const data = await getChainDefaultChartData(name.toLowerCase(), await _getChainChartData(name))
-    return successResponse(res, data, 60);
-  } catch (e) {
-    return errorResponse(res, 'There is no chain with that name: ' + name)
-  }
-}
-
-async function _getChainChartData(name: string) {
-  const global = name === "";
-  const route = global ? 'lite/charts-total' : `lite/charts/${name}`;
-  return readRouteData(route);
-}
-
 async function getDimensionsMetadataRoute(_req: HyperExpress.Request, res: HyperExpress.Response) {
   return successResponse(res, await getDimensionsMetadata(), 60);
 }
 
-export function setProRoutes(router: HyperExpress.Router, _routerBasePath: string) {
-
-  const proWrapper = (routeFn: any) => {  // inject isProRoute flag
-
-    return ew(async (req: HyperExpress.Request, res: HyperExpress.Response) => {
-      (req as any).isProRoute = true
-      return routeFn(req, res)
-    })
-  }
-
-  router.get("/v2/metrics/:type/overview", proWrapper(getOverviewFileRoute))
-  router.get("/v2/metrics/:type/overview/:chain", proWrapper(getOverviewFileRoute))
-  router.get("/v2/metrics/:type/protocol/:name", proWrapper(getDimensionProtocolFileRoute))  // this includes special route financial statement
+interface TvlProtocolRequestParams {
+  name: string; // protocol id ex: aave, uniswap
+  key: string; // tvl, pool2, staking, borrowed, all, default = tvl
+  currency: string; // token/raw, usd, default = usd
 }
 
+const AllowedProtocolKeys = ['tvl', 'staking', 'borrowed', 'pool2', 'vesting', 'all'];
+const AllowedTreasuryKeys = ['tvl', 'OwnTokens', 'all'];
+const AllowedCurrencies = ['token', 'raw', 'usd'];
+
+function decodeTvlRequestParams(req: HyperExpress.Request): TvlProtocolRequestParams {
+  return {
+    name: decodeURIComponent(req.path_parameters.name),
+    key: req.query_parameters.key ? decodeURIComponent(req.query_parameters.key) : 'tvl',
+    currency: req.query_parameters.currency ? decodeURIComponent(req.query_parameters.currency) : 'usd',
+  }
+}
+
+export function getTvlProtocolRoutes(dataType: 'protocol' | 'treasury', route: 'overview' | 'chart-total' | 'chart-chain-breakdown' | 'chart-token-breakdown') {
+  return async function (req: HyperExpress.Request, res: HyperExpress.Response) {
+    let { name, key, currency } = decodeTvlRequestParams(req);
+    
+    if (dataType === 'protocol') {
+      if ((route === 'chart-total' || route === 'chart-chain-breakdown') && !AllowedProtocolKeys.includes(key)) {
+        return errorResponse(res, `Query key=${key} is not allowed`);
+      }
+    } else if (dataType === 'treasury') {
+      if (!AllowedTreasuryKeys.includes(key)) {
+        return errorResponse(res, `Query key=${key} is not allowed`);
+      }
+    }
+    
+    if (route === 'chart-token-breakdown' && !AllowedCurrencies.includes(currency)) {
+      return errorResponse(res, `Query currency=${currency} is not allowed`);
+    }
+
+    name = sluggify({ name } as any);
+    const protocolData = (cache as any)[dataType + 'SlugMap'][name];
+    res.setHeaders({
+      "Expires": get20MinDate()
+    })
+    
+    let protocolDataFull: any = {}
+    
+    // check if it is a parent protocol
+    if (!protocolData && dataType === 'protocol') {
+      const parentProtocol = (cache as any)['parentProtocolSlugMap'][name];
+      if (parentProtocol) {
+        protocolDataFull = await craftParentProtocolV2({
+          parentProtocol: parentProtocol,
+          skipAggregatedTvl: false,
+          feMini: false,
+        });
+      } else {
+        return errorResponse(res, `Protocol ${name} not found`)
+      }
+    } else {
+      if (!protocolData)
+        return errorResponse(res, `Protocol ${name} not found`)
+      
+      protocolDataFull = await craftProtocolV2({
+        protocolData,
+        useNewChainNames: true,
+        skipAggregatedTvl: false,
+        restrictResponseSize: false,
+        feMini: false,
+      });
+    }
+
+    let responseData: any;
+    if (route === 'overview') {
+      responseData = protocolDataFull;
+      delete responseData.tvl;
+      delete responseData.chainTvls;
+      delete responseData.tokens;
+      delete responseData.tokensInUsd;
+    } else {
+      responseData = [];
+      
+      if (dataType === 'protocol') {
+        if (route === 'chart-total' || route === 'chart-chain-breakdown') {
+          const itemByDates: Record<number, any> = {}
+          for (const [chainAndKey, chainData] of Object.entries(protocolDataFull.chainTvls)) {
+            let [chainFilter, keyFilter] = chainAndKey.split('-');
+            
+            console.log(chainAndKey)
+            
+            if (AllowedProtocolKeys.includes(chainFilter)) continue;
+            if (!keyFilter) keyFilter = 'tvl';
+            
+            if (key === keyFilter || key === 'all') {
+              for (const tvlItem of Object.values((chainData as any).tvl)) {
+                if (route === 'chart-total') {
+                  itemByDates[(tvlItem as any).date] = itemByDates[(tvlItem as any).date] || 0;
+                  itemByDates[(tvlItem as any).date] += Number((tvlItem as any).totalLiquidityUSD);
+                } else {
+                  itemByDates[(tvlItem as any).date] = itemByDates[(tvlItem as any).date] || {};
+                  itemByDates[(tvlItem as any).date][chainFilter] = itemByDates[(tvlItem as any).date][chainFilter] || 0;
+                  itemByDates[(tvlItem as any).date][chainFilter] += Number((tvlItem as any).totalLiquidityUSD);
+                }
+              }
+            }
+          }
+          
+          for (const [date, items] of Object.entries(itemByDates)) {
+            responseData.push([Number(date), items]);
+          }
+        } else if (dataType === 'protocol' && route === 'chart-token-breakdown') {
+          const tokenKey = currency === 'usd' ? 'tokensInUsd' : 'tokens';
+          for (const item of Object.values(protocolDataFull[tokenKey])) {
+            responseData.push([Number((item as any).date), (item as any).tokens]);
+          }
+        }
+      } else if (dataType === 'treasury') {
+        const itemByDates: Record<number, any> = {}
+        for (const [chainAndKey, chainData] of Object.entries(protocolDataFull.chainTvls)) {
+          let [chainFilter, keyFilter] = chainAndKey.split('-');
+          
+          if (chainFilter === 'OwnTokens') continue;
+          
+          if (AllowedProtocolKeys.includes(chainFilter)) continue;
+          if (!keyFilter) keyFilter = 'tvl';
+          
+          let dataKey: string = 'tvl';
+          if (route === 'chart-token-breakdown') {
+            dataKey = currency === 'usd' ? 'tokensInUsd' : 'tokens';
+          }
+          
+          if (key === keyFilter || key === 'all') {
+            for (const tvlItem of Object.values((chainData as any)[dataKey])) {
+              if (route === 'chart-total') {
+                itemByDates[(tvlItem as any).date] = itemByDates[(tvlItem as any).date] || 0;
+                itemByDates[(tvlItem as any).date] += Number((tvlItem as any).totalLiquidityUSD);
+              } else if (route === 'chart-chain-breakdown') {
+                itemByDates[(tvlItem as any).date] = itemByDates[(tvlItem as any).date] || {};
+                itemByDates[(tvlItem as any).date][chainFilter] = itemByDates[(tvlItem as any).date][chainFilter] || 0;
+                itemByDates[(tvlItem as any).date][chainFilter] += Number((tvlItem as any).totalLiquidityUSD);
+              } else if (route === 'chart-token-breakdown') {
+                itemByDates[(tvlItem as any).date] = itemByDates[(tvlItem as any).date] || {};
+                for (const [symbol, balance] of Object.entries((tvlItem as any).tokens)) {
+                  itemByDates[(tvlItem as any).date][symbol] = itemByDates[(tvlItem as any).date][symbol] || 0;
+                  itemByDates[(tvlItem as any).date][symbol] += Number(balance);
+                }
+              }
+            }
+          }
+        }
+        
+        for (const [date, items] of Object.entries(itemByDates)) {
+          responseData.push([Number(date), items]);
+        }
+      }
+    }
+    
+    return res.json(responseData);
+  }
+}
+
+export function getOraclesRoutes(route: 'overview' | 'chart-total' | 'chart-protocol-breakdown' | 'chart-chain-breakdown') {
+  return async function (req: HyperExpress.Request, res: HyperExpress.Response) {
+    const chainFilter = req.path_parameters.chain ? getChainLabelFromKey(decodeURIComponent(req.path_parameters.chain)) : null;
+    const protocolFilter = req.path_parameters.protocol ? decodeURIComponent(req.path_parameters.protocol) : null;
+    
+    const keyFilter = req.query_parameters.key ? decodeURIComponent(req.query_parameters.key) : 'tvl';
+    
+    if (!AllowedProtocolKeys.concat(AllowedTreasuryKeys).includes(keyFilter)) {
+      return errorResponse(res, `Query key=${keyFilter} is not allowed`);
+    }
+    
+    let routeFilePath = `oracles-v2`;
+    if (route === 'overview') {
+      routeFilePath += `/overview`;
+      const data = await readRouteData(routeFilePath);
+      return successResponse(res, data);
+    } else {
+      if (chainFilter) {
+        routeFilePath += `/charts/chains/${chainFilter}-${keyFilter}`;
+        if (route === 'chart-protocol-breakdown') routeFilePath += `protocol-breakdown`;
+      } else if (protocolFilter) {
+        routeFilePath += `/charts/protocols/${protocolFilter}-${keyFilter}`;
+        if (route === 'chart-chain-breakdown') routeFilePath += `chain-breakdown`;
+      } else {
+        // chart total
+        routeFilePath += `/charts/total-${keyFilter}`;
+        if (route === 'chart-chain-breakdown') routeFilePath += `chain-breakdown`;
+        else if (route === 'chart-protocol-breakdown') routeFilePath += `protocol-breakdown`;
+      }
+      const data = await readRouteData(routeFilePath);
+      if (!data) return errorResponse(res, 'Request data not found');
+      return successResponse(res, data);
+    }
+  }
+}
+
+export function getForksRoutes(route: 'overview' | 'chart-total') {
+  return async function (req: HyperExpress.Request, res: HyperExpress.Response) {
+    const protocolFilter = req.path_parameters.protocol ? decodeURIComponent(req.path_parameters.protocol) : null;
+    const keyFilter = req.query_parameters.key ? decodeURIComponent(req.query_parameters.key) : 'tvl';
+    
+    if (!AllowedProtocolKeys.concat(AllowedTreasuryKeys).includes(keyFilter)) {
+      return errorResponse(res, `Query key=${keyFilter} is not allowed`);
+    }
+    
+    let routeFilePath = `forks-v2`;
+    if (route === 'overview') {
+      routeFilePath += `/overview`;
+    } else {
+      if (protocolFilter) {
+        // chart protocol
+        routeFilePath += `/charts/protocols/${protocolFilter}-${keyFilter}`;
+      } else {
+        // chart total
+        routeFilePath += `/charts/total-${keyFilter}-protocol-breakdown`;
+      }
+    }
+    
+    const data = await readRouteData(routeFilePath);
+    if (!data) return errorResponse(res, 'Request data not found');
+    return successResponse(res, data);
+  }
+}
 
 /* 
 async function getProtocolUsers(req: HyperExpress.Request, res: HyperExpress.Response) {
